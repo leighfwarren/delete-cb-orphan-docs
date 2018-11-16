@@ -3,6 +3,7 @@ package com.atex;
 import com.couchbase.client.java.Bucket;
 import com.couchbase.client.java.Cluster;
 import com.couchbase.client.java.CouchbaseCluster;
+import com.couchbase.client.java.document.RawJsonDocument;
 import com.couchbase.client.java.view.ViewQuery;
 import com.couchbase.client.java.view.ViewResult;
 import com.couchbase.client.java.view.ViewRow;
@@ -12,7 +13,7 @@ import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.Options;
 
-public class DeleteOrphans {
+public class DeleteOrphanActivities {
 
   // Input values
   private static String cbAddress;
@@ -39,22 +40,25 @@ public class DeleteOrphans {
       result = bucket.query(ViewQuery.from(design, view));
     }
     System.out.println("==============================================================");
-    System.out.println("========= Number of Hangers in the view: " + result.totalRows() + " ===========");
+    System.out.println("========= Number of HangersAlias in the view: " + result.totalRows() + " ===========");
     System.out.println("==============================================================");
     for (ViewRow row : result) {
       processed++;
-      String hangerId = row.id();
-      String hangerInfoId = Utils.getHangerInfoFromHangerId(hangerId);
-      if (Utils.getItem(hangerInfoId) == null) {
-        if (Utils.removeHanger(hangerId)) {
-          removed++;
-          if (batchSize > 0 && removed >= batchSize) {
-            break;
-          }
+      String hangerAliasId = row.id();
+      RawJsonDocument str = row.document(RawJsonDocument.class);
+      if (str == null) {
+        System.out.println("NULL RawJsonDocument for: " + hangerAliasId);
+        continue;
+      }
+      String aliasContent = str.content();
+      if (processHangerAlias(hangerAliasId, aliasContent)) {
+        removed++;
+        if (batchSize > 0 && removed >= batchSize) {
+          break;
         }
       }
       if (processed % 100000 == 0) {
-        System.out.println("=== HANGERS PROCESSED: " + processed);
+        System.out.println("=== HANGER ALIAS PROCESSED: " + processed);
       }
     }
     System.out.println("==============================================================");
@@ -62,6 +66,21 @@ public class DeleteOrphans {
     System.out.println("==============================================================");
 
     cluster.disconnect();
+  }
+
+  private static boolean processHangerAlias(String aliasId, String aliasContent) {
+    String contentHangerInfoId = aliasId.replace("HangerAlias::externalId::onecms:", "HangerInfo::");
+    String activityServiceHangerInfoId = aliasContent.replace("\"", "");
+    activityServiceHangerInfoId = activityServiceHangerInfoId.replace("onecms:", "HangerInfo::");
+    if (Utils.getItem(contentHangerInfoId) == null) {
+      System.out.println("The content " + contentHangerInfoId + " has been removed");
+      System.out.println("We need to clear recursively " + activityServiceHangerInfoId);
+      if (Utils.removeHangerInfo(activityServiceHangerInfoId)) {
+        Utils.deleteItem(aliasId);
+        return true;
+      }
+    }
+    return false;
   }
 
   public static void main(String[] args) {
