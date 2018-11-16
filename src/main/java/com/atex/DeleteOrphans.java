@@ -12,6 +12,8 @@ import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.Options;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 public class DeleteOrphans {
 
   // Input values
@@ -31,7 +33,7 @@ public class DeleteOrphans {
     Utils.init(bucket, dryRun);
 
     int processed = 0;
-    int removed = 0;
+    AtomicInteger removed = new AtomicInteger();
     ViewResult result;
     if (devView) {
       result = bucket.query(ViewQuery.from(design, view).development());
@@ -45,7 +47,25 @@ public class DeleteOrphans {
       processed++;
       String hangerId = row.id();
       String hangerInfoId = Utils.getHangerInfoFromHangerId(hangerId);
-      if (Utils.getItem(hangerInfoId) == null) {
+
+      // Try async
+      Utils.getItemEx(hangerInfoId).map(item -> {
+        if (item == null) {
+          Utils.removeH(hangerInfoId).map( doc -> {
+            if (doc != null) {
+              removed.getAndIncrement();
+              if (batchSize > 0 && removed.get() >= batchSize) {
+                // How to exit here!!!!
+              }
+            }
+            return doc;
+          });
+        }
+        return item;
+      });
+
+
+      /*if (Utils.getItem(hangerInfoId) == null) {
         if (Utils.removeHanger(hangerId)) {
           removed++;
           if (batchSize > 0 && removed >= batchSize) {
@@ -55,7 +75,7 @@ public class DeleteOrphans {
       }
       if (processed % 100000 == 0) {
         System.out.println("=== HANGERS PROCESSED: " + processed);
-      }
+      }*/
     }
     System.out.println("==============================================================");
     System.out.println("====== Number of Orphan Hangers processed: " + removed + " =========");
