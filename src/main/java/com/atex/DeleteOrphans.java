@@ -1,16 +1,16 @@
 package com.atex;
 
+import com.couchbase.client.java.AsyncBucket;
 import com.couchbase.client.java.Bucket;
 import com.couchbase.client.java.Cluster;
 import com.couchbase.client.java.CouchbaseCluster;
 import com.couchbase.client.java.view.ViewQuery;
-import com.couchbase.client.java.view.ViewResult;
-import com.couchbase.client.java.view.ViewRow;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
 import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.Options;
+import rx.Observable;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -32,53 +32,52 @@ public class DeleteOrphans {
 
     Utils.init(bucket, dryRun);
 
-    int processed = 0;
+    AtomicInteger processed = new AtomicInteger();
     AtomicInteger removed = new AtomicInteger();
-    ViewResult result;
+
+    ViewQuery viewQuery;
     if (devView) {
-      result = bucket.query(ViewQuery.from(design, view).development());
+      viewQuery = ViewQuery.from(design, view).development();
     } else {
-      result = bucket.query(ViewQuery.from(design, view));
+      viewQuery = ViewQuery.from(design, view);
     }
-    System.out.println("==============================================================");
-    System.out.println("========= Number of Hangers in the view: " + result.totalRows() + " ===========");
-    System.out.println("==============================================================");
-    for (ViewRow row : result) {
-      processed++;
-      String hangerId = row.id();
-      String hangerInfoId = Utils.getHangerInfoFromHangerId(hangerId);
-
-      // Try async
-      Utils.getItemEx(hangerInfoId).map(item -> {
-        if (item == null) {
-          Utils.removeH(hangerInfoId).map( doc -> {
-            if (doc != null) {
+    AsyncBucket asyncBucket = bucket.async();
+    asyncBucket.query(viewQuery)
+        .flatMap(results -> {
+          System.out.println("==============================================================");
+          System.out.println("========= Number of Hangers in the view: " + results.totalRows() + " ===========");
+          System.out.println("==============================================================");
+          return results.rows();
+        })
+        //.onBackpressureBuffer()
+        //.skip(27)
+        //.limit(1)
+        .takeWhile((c) -> {
+          //System.out.println("takeWhile Processed: " + removed.get() + " - BatchSize: " + batchSize);
+          return batchSize <= 0 || removed.get() <= batchSize; // TODO: Investigate this, removed is not up to date while streaming rows
+        })
+        .flatMap(row -> {
+          String hangerId = row.id();
+          return Utils.getItemEx(Utils.getHangerInfoFromHangerId(hangerId)).singleOrDefault(null).flatMap(doc -> {
+            if (doc == null) {
               removed.getAndIncrement();
-              if (batchSize > 0 && removed.get() >= batchSize) {
-                // How to exit here!!!!
-              }
+              return Utils.removeHangerEx(hangerId);
+              //.flatMap(result -> Observable.just(doc));  // result is a Boolean, uncomment this if you want to return JsonDocument
             }
-            return doc;
+            return Observable.just(false); // Return false, instead of empty otherwise subscribe is not called and processed is not incremented
           });
-        }
-        return item;
-      });
-
-
-      /*if (Utils.getItem(hangerInfoId) == null) {
-        if (Utils.removeHanger(hangerId)) {
-          removed++;
-          if (batchSize > 0 && removed >= batchSize) {
-            break;
+        })
+        .onErrorResumeNext(throwable -> Observable.empty())
+        .toBlocking()
+        .subscribe(result -> {
+          processed.addAndGet(1);
+          if (processed.get() % 10000 == 0) {
+            System.out.println("=== HANGERS PROCESSED: " + processed);
           }
-        }
-      }
-      if (processed % 100000 == 0) {
-        System.out.println("=== HANGERS PROCESSED: " + processed);
-      }*/
-    }
+        });
+
     System.out.println("==============================================================");
-    System.out.println("====== Number of Orphan Hangers processed: " + removed + " =========");
+    System.out.println("====== Number of Orphan Hangers deleted: " + removed + " ========");
     System.out.println("==============================================================");
 
     cluster.disconnect();
