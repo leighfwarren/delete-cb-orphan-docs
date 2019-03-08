@@ -49,6 +49,9 @@ public class DeleteOrphans {
   public static final String ATEX_ONECMS_ARTICLE = "atex.onecms.article";
   private static final String NOSQL_ARTICLE_TYPE = "com.atex.nosql.article.ArticleBean";
   private static final String ARTCLE_BEAN_EXTENDED = "com.atex.nosql.article.ArticleBeanExtended";
+  private static final String ATEX_REMOTE_TRACKER = "com.atex.nosql.RemoteContentTrackerBean";
+  private static final String ATEX_ONECMS = "atex.OneCMS";
+  public static final String CREATED_WITH_TEMPLATE = "createdWithTemplate";
   // Input values
   private static String cbAddress;
   private static String cbBucket;
@@ -69,14 +72,15 @@ public class DeleteOrphans {
 
   private static Bucket bucket;
   private static String startKey;
-  private static int numThreads = 10;
+  private static int numThreads = 8;
 
   private static volatile int processed = 0;
   private static volatile int converted = 0;
   private static volatile int removed = 0;
 
-  private static Set<String> deletedKeys = Collections.synchronizedSet(new HashSet<>());
-  private static Set<String> convertedKeys  = Collections.synchronizedSet(new HashSet<>());
+  private static final Set<String> deletedKeys = Collections.synchronizedSet(new HashSet<>());
+  private static final Set<String> convertedKeys  = Collections.synchronizedSet(new HashSet<>());
+  private static boolean fixData = false;
 
   private static JsonDocument getItem(String id) {
     JsonDocument response = null;
@@ -130,16 +134,33 @@ public class DeleteOrphans {
     }
   }
 
-  private static boolean removeHanger(String hangerId) {
+  private static boolean removeHanger(String hangerId, JsonDocument hangerInfo, List<String> keys) {
 
-    List<String> keys = new ArrayList<>();
 
     JsonDocument doc = getItem(hangerId);
     if (doc != null) {
       removeAspects(doc, keys);
       deleteItem(hangerId, keys);
-      sendDeletes(keys);
+
     }
+    // Hanger Info supplied, so also delete that and all versions
+    if (hangerInfo != null) {
+      keys.add(hangerInfo.id());
+      JsonArray versions = hangerInfo.content().getArray("versions");
+      for (int i = 0; i < versions.size(); i++) {
+        JsonObject o = versions.getObject(i);
+        String version = o.getString("version");
+        String newhangerId = getHangerIdFromContentId(version);
+
+        JsonDocument hangerDoc = getItem(hangerId);
+        if (hangerDoc != null) {
+          removeAspects(hangerDoc, keys);
+          deleteItem(newhangerId, keys);
+        }
+      }
+
+    }
+
     return true;
   }
 
@@ -168,7 +189,8 @@ public class DeleteOrphans {
             .build();
 
     Cluster cluster = CouchbaseCluster.create(env, cbAddress);
-    bucket = cluster.openBucket(cbBucket, cbBucketPwd);
+    cluster.authenticate("cmuser", cbBucketPwd);
+    bucket = cluster.openBucket(cbBucket);
 
 
 
@@ -201,7 +223,7 @@ public class DeleteOrphans {
     log.info ("Finished @ " + new Date());
 
     log.info("==============================================================");
-    log.info("====== Number of Orphan Hangers processed: " + removed + " =========");
+    log.info("====== Number of Orphan Hangers removed: " + removed + " =========");
     log.info("====== Number of Legacy Hangers converted: " + converted + " =========");
     log.info("==============================================================");
 
@@ -216,31 +238,45 @@ public class DeleteOrphans {
 
   private static boolean processRow(float total, long timeStarted, String hangerId) {
     List<JsonDocument> updates = new ArrayList<>();
+    List<String> deletes = new ArrayList<>();
     processed++;
 
+    log.info ("Processing row : " + hangerId + " on thread " + Thread.currentThread().getName());
     String hangerInfoId = getHangerInfoFromHangerId(hangerId);
     JsonDocument hangerInfo = getItem(hangerInfoId);
     if (hangerInfo == null) {
-      if (removeHanger(hangerId)) {
+      if (removeHanger(hangerId, null, deletes)) {
         removed++;
       }
-    } else {
+    } else if (fixData){
       boolean needsIndexing = false;
       JsonDocument hanger = getItem(hangerId);
       String type = hanger.content().getString("type");
       accumlateTotals (type);
       if (type.equalsIgnoreCase(NOSQL_IMAGE_TYPE)) {
-        needsIndexing = convertAspect(hangerId, hanger, NOSQL_IMAGE_TYPE, ATEX_ONECMS_IMAGE, "com.atex.onecms.app.dam.standard.aspects.OneImageBean", false, updates);
+        needsIndexing = convertAspect(hangerId, hanger, NOSQL_IMAGE_TYPE, ATEX_ONECMS_IMAGE, "com.atex.onecms.app.dam.standard.aspects.OneImageBean", false, updates, deletes);
         converted++;
       } else if (type.equalsIgnoreCase(NOSQL_ARTICLE_TYPE)) {
-        needsIndexing = convertAspect(hangerId, hanger, NOSQL_ARTICLE_TYPE, ATEX_ONECMS_ARTICLE, "com.atex.onecms.app.dam.standard.aspects.CustomArticleBean", true, updates);
+        needsIndexing = convertAspect(hangerId, hanger, NOSQL_ARTICLE_TYPE, ATEX_ONECMS_ARTICLE, "com.atex.onecms.app.dam.standard.aspects.CustomArticleBean", true, updates, deletes);
         converted++;
+        } else if (type.equalsIgnoreCase(ATEX_ONECMS_ARTICLE )) {
+          //needsIndexing = fixAspectTimeState(hanger, ATEX_ONECMS_ARTICLE, NOSQL_ARTICLE_TYPE, updates);
+        }  else if (type.equalsIgnoreCase(ATEX_ONECMS_IMAGE)) {
+          //needsIndexing = fixAspectTimeState(hanger, ATEX_ONECMS_IMAGE, NOSQL_IMAGE_TYPE, updates);
+      } else if (type.equalsIgnoreCase(ATEX_REMOTE_TRACKER)
+              || type.equalsIgnoreCase("com.atex.onecms.content.WorkspaceBean")
+              || type.equalsIgnoreCase("com.atex.onecms.content.DraftContent")
+              || type.equalsIgnoreCase("atex.activity.Activities")
+      ) {
+        accumlateTotals("Content type " + type + " removed");
+        removeHanger(hangerId, hangerInfo, deletes);
       }
       if (needsIndexing) {
         sendKafkaMutation (hangerId, hangerInfo, updates);
       }
     }
     if (!updates.isEmpty()) sendUpdates(updates);
+    if (!deletes.isEmpty()) sendDeletes(deletes);
 
     if (batchSize > 0 && (removed + converted) >= batchSize) {
       return true;
@@ -257,6 +293,38 @@ public class DeleteOrphans {
     }
     return false;
   }
+
+  private static void fixOneCMS(String aspectContentId, List<JsonDocument> updates) {
+
+    accumlateTotals("One CMS Aspects checked");
+    String aspectId = getAspectIdFromContentId(aspectContentId);
+
+    JsonDocument aspect = getItem(aspectId);
+    if (aspect != null) {
+      JsonObject data = aspect.content().getObject("data");
+      boolean changed = false;
+      String createdWith = data.getString(CREATED_WITH_TEMPLATE);
+      if (createdWith != null) {
+        if (createdWith.equalsIgnoreCase("act.template.nosql.Image")) {
+          data.removeKey(CREATED_WITH_TEMPLATE);
+          data.put(CREATED_WITH_TEMPLATE, "atex.onecms.image");
+          changed = true;
+        }
+
+        if (createdWith.equalsIgnoreCase("act.template.nosql.Article.print")) {
+          data.removeKey(CREATED_WITH_TEMPLATE);
+          data.put(CREATED_WITH_TEMPLATE, "atex.onecms.article.print");
+          changed = true;
+        }
+      }
+      if (changed) {
+        accumlateTotals("One CMS Aspects updated");
+        updates.add(aspect);
+      }
+    }
+
+  }
+
 
   private static void sendUpdates(List<JsonDocument> items) {
     //items.forEach(doc -> System.out.println(doc.id()));
@@ -328,9 +396,57 @@ public class DeleteOrphans {
 
   }
 
+  private static boolean fixAspectTimeState(JsonDocument hanger, String targetType, String sourceType, List<JsonDocument> updates) {
+    JsonObject aspects = hanger.content().getObject("aspectLocations");
+    // Conversion went wrong , so this only happens in very specific circumstances , i.e. hanger type is onecms.article, but the aspects still contains noSQL.
+    if (aspects.containsKey(sourceType)) {
+      aspects.put(targetType, aspects.getString(sourceType));
+      aspects.removeKey(sourceType);
+      updates.add(hanger);
+      accumlateTotals("Broken Aspects Fixed");
+    }
+
+    String aspectContentId = aspects.getString(targetType);
+    if (aspectContentId != null) {
+      String aspectId = getAspectIdFromContentId(aspectContentId);
+
+      JsonDocument aspect = getItem(aspectId);
+      if (aspect != null) {
+        boolean updated = false;
+        JsonObject data = aspect.content().getObject("data");
+
+        if (data.containsKey("timeState")) {
+          JsonObject tso = data.getObject("timeState");
+
+          if (tso.getString("_type").equalsIgnoreCase("com.atex.nosql.article.TimeState")) {
+            tso.put("_type", "com.atex.onecms.app.dam.types.TimeState");
+            updated=true;
+            accumlateTotals("TimeState date converted");
+
+          }
+        }
+        if (data.containsKey("webImage")) {
+          data.removeKey("webImage");
+          updated = true;
+        }
+        if (data.containsKey("actDraft")) {
+          data.removeKey("actDraft");
+          updated = true;
+        }
+        if (updated) {
+          updates.add(aspect);
+        }
+      }
+    }
+    return false;
+  }
 
   private static String getAspectIdFromContentId(String aspectContentId) {
     return "Aspect::" + aspectContentId.replace("onecms:", "").replace(":", "::");
+  }
+
+  private static String getHangerIdFromContentId(String hangerContentId) {
+    return "Hanger::" + hangerContentId.replace("onecms:", "").replace(":", "::");
   }
 
   private static synchronized void accumlateTotals(String type) {
@@ -348,7 +464,7 @@ public class DeleteOrphans {
   private static boolean convertAspect(String hangerId, JsonDocument hanger,
                                        String sourceType, String targetType,
                                        String targetBean, boolean convertWireArticles,
-                                       List<JsonDocument> updates) {
+                                       List<JsonDocument> updates, List<String> deletes) {
     boolean needsIndexing = false;
     JsonObject aspects = hanger.content().getObject("aspectLocations");
     String aspectContentId = aspects.getString(sourceType);
@@ -378,6 +494,9 @@ public class DeleteOrphans {
 
         // This is no longer in OneArticleBean
         data.removeKey("editorsPickHeadline");
+        data.removeKey("webImage");
+        data.removeKey("actDraft");
+        data.removeKey("remoteContentId");
 
         String name = (String) data.get("name");
         if (convertWireArticles && name != null && name.matches(".*PRESSUK_.*")) {
@@ -390,14 +509,18 @@ public class DeleteOrphans {
         String extendedContentId = aspects.getString(ARTCLE_BEAN_EXTENDED);
         if (extendedContentId != null) {
           String extendedAspectId = getAspectIdFromContentId(extendedContentId);
-
+          deletes.add(extendedAspectId);
           JsonDocument extended = getItem(extendedAspectId);
-          JsonObject extendedData = extended.content().getObject("data");
+          if (extended != null) {
+            JsonObject extendedData = extended.content().getObject("data");
 
-          for (String key : extendedData.getNames()) {
-            if (!key.equalsIgnoreCase(("_type"))){
-              data.put(key, extendedData.get(key));
+            for (String key : extendedData.getNames()) {
+              if (!key.equalsIgnoreCase(("_type"))) {
+                data.put(key, extendedData.get(key));
+              }
             }
+          } else {
+            log.warning("Missing aspect " + extendedAspectId);
           }
 
           aspects.removeKey(ARTCLE_BEAN_EXTENDED);
@@ -410,11 +533,17 @@ public class DeleteOrphans {
           log.info ("TEST  "+ aspectContentId + " to " + targetType);
         }
       }
-      // Need to remove and replace aspect just in case the versions have not changed.
-      if (aspects.containsKey(sourceType)) {
-        aspects.removeKey(sourceType);
-        aspects.put(targetType, aspectContentId);
-      }
+
+    }
+    String oneCMSAspectId = aspects.getString(ATEX_ONECMS);
+
+    if (oneCMSAspectId != null && !alreadyConverted(oneCMSAspectId)) {
+      fixOneCMS(oneCMSAspectId, updates);
+    }
+    // Need to remove and replace aspect just in case the versions have not changed.
+    if (aspects.containsKey(sourceType)) {
+      aspects.removeKey(sourceType);
+      aspects.put(targetType, aspectContentId);
     }
     hanger.content().put("type", targetType);
 
@@ -446,6 +575,7 @@ public class DeleteOrphans {
     options.addOption("view", true, "The hangers design view");
     options.addOption("devView", false, "the view is in development (Optional)");
     options.addOption("dryRun", false, "To just output the docs to be deleted (Optional)");
+    options.addOption("fixData", false, "To also fix & convert legacy data");
     options.addOption("batchSize", true, "Limit to a number of hanger deletions (Optional)");
     options.addOption("startKey", true, "Starting ID if re-starting the process after failure");
     options.addOption("numThreads", true, "Number of threads to use, default 10");
@@ -494,6 +624,10 @@ public class DeleteOrphans {
 
       if (cmdLine.hasOption("startKey")) {
         startKey = cmdLine.getOptionValue("startKey");
+      }
+
+      if (cmdLine.hasOption("fixData")) {
+        fixData = true;
       }
 
     } catch (Exception e) {
