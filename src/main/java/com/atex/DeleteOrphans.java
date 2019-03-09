@@ -15,6 +15,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.FileHandler;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -81,6 +82,10 @@ public class DeleteOrphans {
   private static final Set<String> deletedKeys = Collections.synchronizedSet(new HashSet<>());
   private static final Set<String> convertedKeys  = Collections.synchronizedSet(new HashSet<>());
   private static boolean fixData = false;
+  private static boolean tidyUp = false;
+  private static int limit = -1;
+  private static int skip = -1;
+  private static volatile AtomicInteger last_percentage = new AtomicInteger();
 
   private static JsonDocument getItem(String id) {
     JsonDocument response = null;
@@ -94,7 +99,7 @@ public class DeleteOrphans {
     return response;
   }
 
-  private static void deleteItem(String id, List<String> keys) {
+  private static boolean deleteItem(String id, List<String> keys) {
     if (!alreadyDeleted(id)) {
       if (!dryRun) {
         log.info("REMOVING: " + id);
@@ -102,7 +107,9 @@ public class DeleteOrphans {
       } else {
         log.info("(DRY-RUN) REMOVING: " + id);
       }
+      return true;
     }
+    return false;
   }
 
   private static boolean alreadyDeleted(String id) {
@@ -145,17 +152,18 @@ public class DeleteOrphans {
     }
     // Hanger Info supplied, so also delete that and all versions
     if (hangerInfo != null) {
-      keys.add(hangerInfo.id());
-      JsonArray versions = hangerInfo.content().getArray("versions");
-      for (int i = 0; i < versions.size(); i++) {
-        JsonObject o = versions.getObject(i);
-        String version = o.getString("version");
-        String newhangerId = getHangerIdFromContentId(version);
+      if (deleteItem(hangerInfo.id(), keys)) {
+        JsonArray versions = hangerInfo.content().getArray("versions");
+        for (int i = 0; i < versions.size(); i++) {
+          JsonObject o = versions.getObject(i);
+          String version = o.getString("version");
+          String newhangerId = getHangerIdFromContentId(version);
 
-        JsonDocument hangerDoc = getItem(hangerId);
-        if (hangerDoc != null) {
-          removeAspects(hangerDoc, keys);
-          deleteItem(newhangerId, keys);
+          JsonDocument hangerDoc = getItem(hangerId);
+          if (hangerDoc != null) {
+            removeAspects(hangerDoc, keys);
+            deleteItem(newhangerId, keys);
+          }
         }
       }
 
@@ -203,6 +211,14 @@ public class DeleteOrphans {
     if (startKey != null) {
       query = query.startKey(startKey);
     }
+    if (limit > 0) {
+      query.limit(limit);
+    }
+
+    if (skip > 0) {
+      query.skip(skip);
+    }
+
     ViewResult result = bucket.query(query);
     float total = result.totalRows();
     log.info("Number of Hangers in the view: " + result.totalRows());
@@ -214,6 +230,11 @@ public class DeleteOrphans {
 
     for (ViewRow row : result) {
       bex.submitTask(() -> processRow(total, timeStarted, row.id()));
+
+      // Not ideal as we have multiple threads running, but it should help jump out early when done
+      if (batchSize > 0 && (removed + converted) >= batchSize) {
+        break;
+      }
     }
     executor.shutdown();
     executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
@@ -222,54 +243,73 @@ public class DeleteOrphans {
 
     log.info ("Finished @ " + new Date());
 
-    log.info("==============================================================");
-    log.info("====== Number of Orphan Hangers removed: " + removed + " =========");
-    log.info("====== Number of Legacy Hangers converted: " + converted + " =========");
-    log.info("==============================================================");
-
-    for (String key : totals.keySet()) {
-      log.info(key + ", " + totals.get(key));
-    }
-
+    showStatistics();
 
 
     cluster.disconnect();
   }
 
+  private static void showStatistics() {
+
+    StringBuffer buf = new StringBuffer();
+    buf.append("==============================================================\n");
+    buf.append("Number of Hangers processed       : " + processed + "\n");
+    buf.append("Number of Orphan Hangers removed  : " + removed   + "\n");
+    buf.append("Number of Legacy Hangers converted: " + converted + "\n");
+
+    for (String key : totals.keySet()) {
+      buf.append(key).append(" : ").append(totals.get(key)).append("\n");
+    }
+    buf.append("==============================================================\n");
+
+    log.info(buf.toString());
+
+  }
+
   private static boolean processRow(float total, long timeStarted, String hangerId) {
+
+    if (batchSize > 0 && (removed + converted) >= batchSize) {
+      
+    }
+    
     List<JsonDocument> updates = new ArrayList<>();
     List<String> deletes = new ArrayList<>();
     processed++;
 
-    log.info ("Processing row : " + hangerId + " on thread " + Thread.currentThread().getName());
+    //log.fine ("Processing row : " + hangerId + " on thread " + Thread.currentThread().getName());
     String hangerInfoId = getHangerInfoFromHangerId(hangerId);
     JsonDocument hangerInfo = getItem(hangerInfoId);
     if (hangerInfo == null) {
       if (removeHanger(hangerId, null, deletes)) {
         removed++;
       }
-    } else if (fixData){
+    } else if (fixData || tidyUp){
       boolean needsIndexing = false;
       JsonDocument hanger = getItem(hangerId);
       String type = hanger.content().getString("type");
-      accumlateTotals (type);
-      if (type.equalsIgnoreCase(NOSQL_IMAGE_TYPE)) {
-        needsIndexing = convertAspect(hangerId, hanger, NOSQL_IMAGE_TYPE, ATEX_ONECMS_IMAGE, "com.atex.onecms.app.dam.standard.aspects.OneImageBean", false, updates, deletes);
-        converted++;
-      } else if (type.equalsIgnoreCase(NOSQL_ARTICLE_TYPE)) {
-        needsIndexing = convertAspect(hangerId, hanger, NOSQL_ARTICLE_TYPE, ATEX_ONECMS_ARTICLE, "com.atex.onecms.app.dam.standard.aspects.CustomArticleBean", true, updates, deletes);
-        converted++;
-        } else if (type.equalsIgnoreCase(ATEX_ONECMS_ARTICLE )) {
-          //needsIndexing = fixAspectTimeState(hanger, ATEX_ONECMS_ARTICLE, NOSQL_ARTICLE_TYPE, updates);
-        }  else if (type.equalsIgnoreCase(ATEX_ONECMS_IMAGE)) {
-          //needsIndexing = fixAspectTimeState(hanger, ATEX_ONECMS_IMAGE, NOSQL_IMAGE_TYPE, updates);
-      } else if (type.equalsIgnoreCase(ATEX_REMOTE_TRACKER)
-              || type.equalsIgnoreCase("com.atex.onecms.content.WorkspaceBean")
-              || type.equalsIgnoreCase("com.atex.onecms.content.DraftContent")
-              || type.equalsIgnoreCase("atex.activity.Activities")
-      ) {
-        accumlateTotals("Content type " + type + " removed");
-        removeHanger(hangerId, hangerInfo, deletes);
+      accumlateTotals ("Doc. Type " + type);
+      if (fixData) {
+        if (type.equalsIgnoreCase(NOSQL_IMAGE_TYPE)) {
+          needsIndexing = convertAspect(hangerId, hanger, NOSQL_IMAGE_TYPE, ATEX_ONECMS_IMAGE, "com.atex.onecms.app.dam.standard.aspects.OneImageBean", false, updates, deletes);
+          converted++;
+        } else if (type.equalsIgnoreCase(NOSQL_ARTICLE_TYPE)) {
+          needsIndexing = convertAspect(hangerId, hanger, NOSQL_ARTICLE_TYPE, ATEX_ONECMS_ARTICLE, "com.atex.onecms.app.dam.standard.aspects.CustomArticleBean", true, updates, deletes);
+          converted++;
+          } else if (type.equalsIgnoreCase(ATEX_ONECMS_ARTICLE )) {
+            //needsIndexing = fixAspectTimeState(hanger, ATEX_ONECMS_ARTICLE, NOSQL_ARTICLE_TYPE, updates);
+          }  else if (type.equalsIgnoreCase(ATEX_ONECMS_IMAGE)) {
+            //needsIndexing = fixAspectTimeState(hanger, ATEX_ONECMS_IMAGE, NOSQL_IMAGE_TYPE, updates);
+        }
+      }
+      if (tidyUp) {
+        if (type.equalsIgnoreCase(ATEX_REMOTE_TRACKER)
+                || type.equalsIgnoreCase("com.atex.onecms.content.WorkspaceBean")
+                || type.equalsIgnoreCase("com.atex.onecms.content.DraftContent")
+                || type.equalsIgnoreCase("atex.activity.Activities")
+        ) {
+          accumlateTotals("Content type " + type + " removed");
+          removeHanger(hangerId, hangerInfo, deletes);
+        }
       }
       if (needsIndexing) {
         sendKafkaMutation (hangerId, hangerInfo, updates);
@@ -278,18 +318,15 @@ public class DeleteOrphans {
     if (!updates.isEmpty()) sendUpdates(updates);
     if (!deletes.isEmpty()) sendDeletes(deletes);
 
-    if (batchSize > 0 && (removed + converted) >= batchSize) {
-      return true;
-    }
 
-    if (processed % 10000 == 0) {
-      float percentage = processed  * 100 / total;
-      String out = String.format("%f", percentage);
-      long now = System.currentTimeMillis();
-      float duration = now - timeStarted;
-      long endTime = (long) (now + ((total - processed) * (duration / processed)));
-
-      log.info("=== HANGERS PROCESSED: " + processed + ", %age = " + out + ", ETA : "+ new Date(endTime));
+    float percentage = processed  * 100 / total;
+    if (percentage >= last_percentage.getAndSet((int) percentage) + 1) {
+        String out = String.format("%f", percentage);
+        long now = System.currentTimeMillis();
+        float duration = now - timeStarted;
+        long endTime = (long) (now + ((total - processed) * (duration / processed)));
+        showStatistics();
+        log.info("=== HANGERS PROCESSED: " + processed + ", %age = " + out + ", ETA : " + new Date(endTime));
     }
     return false;
   }
@@ -337,16 +374,9 @@ public class DeleteOrphans {
                   @Override
                   public Observable<? extends JsonDocument> call(Throwable throwable) {
                     log.warning ("Error processing doc " + docToInsert.id() + " : " + throwable);
-                    return Observable.error(throwable);
+                    return Observable.empty();
                   }
                 });
-              }
-            })
-            .onErrorResumeNext(new Func1<Throwable, Observable<? extends JsonDocument>>() {
-              @Override
-              public Observable<? extends JsonDocument> call(Throwable throwable) {
-                log.warning ("Error processing batch " +  " : " + throwable);
-                return Observable.error(throwable);
               }
             })
             .retryWhen(RetryBuilder
@@ -354,36 +384,26 @@ public class DeleteOrphans {
                     .delay(Delay.exponential(TimeUnit.MILLISECONDS, 100))
                     .max(10)
                     .build())
-            .last()
             .toBlocking()
-            .single();
+            .lastOrDefault(null);
   }
 
   private static void sendDeletes(List<String> keys) {
     Observable
             .from(keys)
-            .flatMap(new Func1<String, Observable<JsonDocument>>() {
-              @Override
-              public Observable<JsonDocument> call(final String key) {
-                return bucket.async().remove(key).onErrorResumeNext(
-                        new Func1<Throwable, Observable<? extends JsonDocument>>() {
-                          @Override
-                          public Observable<? extends JsonDocument> call(Throwable throwable) {
-                            log.warning ("Error removing key " + key + " : " + throwable);
-                            return Observable.empty();
-                          }
-                        });
-              }
-            })
+            .flatMap((Func1<String, Observable<JsonDocument>>) key -> bucket.async().remove(key).onErrorResumeNext(
+                    throwable -> {
+                      log.warning ("Error removing key " + key + " : " + throwable);
+                      return Observable.empty();
+                    }))
             .doOnError(throwable -> log.log (Level.WARNING, "Error processing batch : " + throwable))
             .retryWhen(RetryBuilder
                     .anyOf(BackpressureException.class)
                     .delay(Delay.exponential(TimeUnit.MILLISECONDS, 100))
                     .max(10)
                     .build())
-            .last()
             .toBlocking()
-            .single();
+            .lastOrDefault(null);
 
   }
 
@@ -473,6 +493,7 @@ public class DeleteOrphans {
 
       JsonDocument aspect = getItem(aspectId);
       if (aspect != null && aspect.content().getString("name").equalsIgnoreCase(sourceType)) {
+        accumlateTotals("Converted from " + sourceType + " to " + targetType);
         aspect.content().put("name", targetType);
         JsonObject data = aspect.content().getObject("data");
         data.put("_type", targetBean);
@@ -576,7 +597,10 @@ public class DeleteOrphans {
     options.addOption("devView", false, "the view is in development (Optional)");
     options.addOption("dryRun", false, "To just output the docs to be deleted (Optional)");
     options.addOption("fixData", false, "To also fix & convert legacy data");
-    options.addOption("batchSize", true, "Limit to a number of hanger deletions (Optional)");
+    options.addOption("tidyUp", false, "Tidy up left over content");
+    options.addOption("batchSize", true, "Limit to a number of hanger deletions/conversions (Optional)");
+    options.addOption("skip", true, "Start at position x in the results set (Optional)");
+    options.addOption("limit", true, "Only process a certain number of hangers (Optional)");
     options.addOption("startKey", true, "Starting ID if re-starting the process after failure");
     options.addOption("numThreads", true, "Number of threads to use, default 10");
 
@@ -626,8 +650,19 @@ public class DeleteOrphans {
         startKey = cmdLine.getOptionValue("startKey");
       }
 
+      if (cmdLine.hasOption("skip")) {
+        skip = Integer.parseInt (cmdLine.getOptionValue("skip"));
+      }
+
+      if (cmdLine.hasOption("limit")) {
+        limit = Integer.parseInt (cmdLine.getOptionValue("limit"));
+      }
+
       if (cmdLine.hasOption("fixData")) {
         fixData = true;
+      }
+      if (cmdLine.hasOption("tidyUp")) {
+        tidyUp = true;
       }
 
     } catch (Exception e) {
