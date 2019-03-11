@@ -40,4 +40,14 @@ where:
 
 -**batchSize** (optional) is an option to limit the deletions to a specific number
 
+-**limit** (optional) limit the result size of the view
 
+-**skip** (optional) skip the first n records from the view
+
+-**tidyUp** (optional) remove un-necessary data (WorkspaceBean, DraftContent, Activities)
+
+-**fixData** (optional) Convert legacy NoSQL to new OneCMS Content types
+
+-**numThreads** (optional) Number of threads to use for processing, default is 8
+
+-**startKey** (optional) Key to start from in the view

@@ -16,6 +16,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.FileHandler;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -85,7 +86,8 @@ public class DeleteOrphans {
   private static boolean tidyUp = false;
   private static int limit = -1;
   private static int skip = -1;
-  private static volatile AtomicInteger last_percentage = new AtomicInteger();
+  private static volatile AtomicInteger lastPercentage = new AtomicInteger();
+  private static volatile AtomicLong lastTime = new AtomicLong();
 
   private static JsonDocument getItem(String id) {
     JsonDocument response = null;
@@ -320,11 +322,19 @@ public class DeleteOrphans {
 
 
     float percentage = processed  * 100 / total;
-    if (percentage >= last_percentage.getAndSet((int) percentage) + 1) {
+    if (percentage >= lastPercentage.getAndSet((int) percentage) + 1) {
         String out = String.format("%f", percentage);
         long now = System.currentTimeMillis();
         float duration = now - timeStarted;
-        long endTime = (long) (now + ((total - processed) * (duration / processed)));
+        long last = lastTime.getAndSet(now);
+        if (last != 0) {
+          duration = now - last;
+        }
+        // Duration of last 1%
+        float percentRemaining = 100 - percentage;
+        long timeRemaining = (long) (duration * percentRemaining);
+
+        long endTime = now + timeRemaining;
         showStatistics();
         log.info("=== HANGERS PROCESSED: " + processed + ", %age = " + out + ", ETA : " + new Date(endTime));
     }
