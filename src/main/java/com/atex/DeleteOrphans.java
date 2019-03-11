@@ -88,6 +88,8 @@ public class DeleteOrphans {
   private static int skip = -1;
   private static volatile AtomicInteger lastPercentage = new AtomicInteger();
   private static volatile AtomicLong lastTime = new AtomicLong();
+  private static int total = 0;
+  private static long timeStarted = 0;
 
   private static JsonDocument getItem(String id) {
     JsonDocument response = null;
@@ -228,16 +230,21 @@ public class DeleteOrphans {
     }
 
     ViewResult result = bucket.query(query);
-    float total = result.totalRows();
-    log.info("Number of Hangers in the view: " + result.totalRows());
+    total = result.totalRows();
+    if (limit > 0) {
+        total = limit;
+        if (skip > 0) total = total - skip;
+    }
+    log.info("Number of Hangers to process : " + total);
     log.info("Number of Threads: " + numThreads);
-    long timeStarted = System.currentTimeMillis();
+    timeStarted = System.currentTimeMillis();
 
     ExecutorService executor = Executors.newFixedThreadPool(numThreads);
     BoundedExecutor bex = new BoundedExecutor(executor, numThreads);
 
     for (ViewRow row : result) {
-      bex.submitTask(() -> processRow(total, timeStarted, row.id()));
+
+        bex.submitTask(() -> processRow(row.id()));
 
       // Not ideal as we have multiple threads running, but it should help jump out early when done
       if (batchSize > 0 && (removed + converted) >= batchSize) {
@@ -274,7 +281,7 @@ public class DeleteOrphans {
 
   }
 
-  private static boolean processRow(float total, long timeStarted, String hangerId) {
+  private static boolean processRow(String hangerId) {
 
     if (batchSize > 0 && (removed + converted) >= batchSize) {
       
@@ -327,7 +334,7 @@ public class DeleteOrphans {
     if (!deletes.isEmpty()) sendDeletes(deletes);
 
 
-    float percentage = processed  * 100 / total;
+    float percentage = (float) processed * 100 / total;
     if (percentage >= lastPercentage.getAndSet((int) percentage) + 1) {
         String out = String.format("%f", percentage);
         long now = System.currentTimeMillis();
