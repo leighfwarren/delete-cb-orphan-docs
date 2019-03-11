@@ -199,8 +199,14 @@ public class DeleteOrphans {
             .build();
 
     Cluster cluster = CouchbaseCluster.create(env, cbAddress);
-    cluster.authenticate("cmuser", cbBucketPwd);
-    bucket = cluster.openBucket(cbBucket);
+
+
+    try {
+      bucket = cluster.openBucket(cbBucket, cbBucketPwd);
+    } catch (Exception e) {
+      cluster.authenticate("cmuser", cbBucketPwd);
+      bucket = cluster.openBucket(cbBucket);
+    }
 
 
 
