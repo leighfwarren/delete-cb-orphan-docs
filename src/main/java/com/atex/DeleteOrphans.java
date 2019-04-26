@@ -1,5 +1,29 @@
 package com.atex;
 
+import com.couchbase.client.core.BackpressureException;
+import com.couchbase.client.core.time.Delay;
+import com.couchbase.client.java.Bucket;
+import com.couchbase.client.java.Cluster;
+import com.couchbase.client.java.CouchbaseCluster;
+import com.couchbase.client.java.document.JsonDocument;
+import com.couchbase.client.java.document.RawJsonDocument;
+import com.couchbase.client.java.document.json.JsonArray;
+import com.couchbase.client.java.document.json.JsonObject;
+import com.couchbase.client.java.env.CouchbaseEnvironment;
+import com.couchbase.client.java.env.DefaultCouchbaseEnvironment;
+import com.couchbase.client.java.util.retry.RetryBuilder;
+import com.couchbase.client.java.view.Stale;
+import com.couchbase.client.java.view.ViewQuery;
+import com.couchbase.client.java.view.ViewResult;
+import com.couchbase.client.java.view.ViewRow;
+import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.CommandLineParser;
+import org.apache.commons.cli.DefaultParser;
+import org.apache.commons.cli.HelpFormatter;
+import org.apache.commons.cli.Options;
+import rx.Observable;
+import rx.functions.Func1;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
@@ -22,28 +46,6 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.logging.SimpleFormatter;
 
-import com.couchbase.client.core.BackpressureException;
-import com.couchbase.client.core.time.Delay;
-import com.couchbase.client.java.Bucket;
-import com.couchbase.client.java.Cluster;
-import com.couchbase.client.java.CouchbaseCluster;
-import com.couchbase.client.java.document.JsonDocument;
-import com.couchbase.client.java.document.json.JsonArray;
-import com.couchbase.client.java.document.json.JsonObject;
-import com.couchbase.client.java.env.CouchbaseEnvironment;
-import com.couchbase.client.java.env.DefaultCouchbaseEnvironment;
-import com.couchbase.client.java.util.retry.RetryBuilder;
-import com.couchbase.client.java.view.ViewQuery;
-import com.couchbase.client.java.view.ViewResult;
-import com.couchbase.client.java.view.ViewRow;
-import org.apache.commons.cli.CommandLine;
-import org.apache.commons.cli.CommandLineParser;
-import org.apache.commons.cli.DefaultParser;
-import org.apache.commons.cli.HelpFormatter;
-import org.apache.commons.cli.Options;
-import rx.Observable;
-import rx.functions.Func1;
-
 public class DeleteOrphans {
 
   public static final String NOSQL_IMAGE_TYPE = "com.atex.nosql.image.ImageContentDataBean";
@@ -63,6 +65,10 @@ public class DeleteOrphans {
   private static boolean devView = false;
   private static boolean dryRun = false;
   private static int batchSize = -1;
+
+  private static String rescueCbAddress;
+  private static String rescueCbBucket;
+  private static String rescueCbBucketPwd;
 
   private static final String CONTENT_ID_PREFIX = "onecms:";
   private static final String DELETION_PREFIX = "deletion:";
@@ -90,6 +96,108 @@ public class DeleteOrphans {
   private static volatile AtomicLong lastTime = new AtomicLong();
   private static int total = 0;
   private static long timeStarted = 0;
+
+  private static Bucket rescueBucket;
+  private static boolean restore = false;
+  private static AtomicInteger restored = new AtomicInteger();
+
+  private static RawJsonDocument getDeletedItem(String id) {
+    RawJsonDocument response = null;
+    try {
+      response = rescueBucket.get(id, RawJsonDocument.class);
+    } catch (NoSuchElementException e) {
+      log.warning("No deleted element with id: " + id);
+    }
+    return response;
+  }
+
+  private static void restoreRow(String id) {
+    RawJsonDocument doc = getDeletedItem(id);
+    try {
+      bucket.insert(doc);
+      //rescueBucket.async().remove(doc).subscribe(); // Don't delete the rescue docs, it's safer!
+      //log.info ("<== RESTORED: " + id);
+    } catch (Exception ex) {
+      log.warning ("Error inserting doc: " + ex);
+      return;
+    }
+    restored.getAndIncrement();
+
+    float percentage =  restored.floatValue() * 100 / total;
+    if (percentage >= lastPercentage.getAndSet((int) percentage) + 1) {
+      String out = String.format("%f", percentage);
+      long now = System.currentTimeMillis();
+      float duration = now - timeStarted;
+      long last = lastTime.getAndSet(now);
+      if (last != 0) {
+        duration = now - last;
+      }
+      // Duration of last 1%
+      float percentRemaining = 100 - percentage;
+      long timeRemaining = (long) (duration * percentRemaining);
+
+      long endTime = now + timeRemaining;
+      showStatistics();
+      log.info("=== DOCS RESTORED: " + restored + ", %age = " + out + ", ETA : " + new Date(endTime));
+    }
+
+  }
+
+  private static void restoreDeleted() throws InterruptedException {
+    ViewQuery query = ViewQuery.from("deleted", "deleted");
+    if (limit > 0) {
+      query.limit(limit);
+    }
+    if (skip > 0) {
+      query.skip(skip);
+    }
+    query.stale(Stale.FALSE);
+
+    ViewResult result = rescueBucket.query(query);
+    total = result.totalRows();
+    log.info("Number of Docs in the deleted view : " + total);
+    log.info("limit : " + limit);
+    log.info("skip : " + skip);
+    if (limit > 0 && total > limit) {
+      total = limit;
+    }
+    log.info("Number of Docs to restore : " + total);
+    log.info("Number of Threads: " + numThreads);
+    timeStarted = System.currentTimeMillis();
+
+    ExecutorService executor = Executors.newFixedThreadPool(numThreads);
+    BoundedExecutor bex = new BoundedExecutor(executor, numThreads);
+    for (ViewRow row : result) {
+      bex.submitTask(() -> restoreRow(row.id()));
+    }
+    executor.shutdown();
+    executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+  }
+
+  private static void sendToRescue(List<String> keys) {
+    Observable
+        .from(keys)
+        .flatMap(new Func1<String, Observable<RawJsonDocument>>() {
+          @Override
+          public Observable<RawJsonDocument> call(String key) {
+            return bucket.async().get(key, RawJsonDocument.class);
+          }
+        })
+        .retryWhen(RetryBuilder
+            .anyOf(BackpressureException.class)
+            .delay(Delay.exponential(TimeUnit.MILLISECONDS, 100))
+            .max(10)
+            .build())
+        .toBlocking()
+        .subscribe(jsonDocument ->  {
+          try {
+            rescueBucket.insert(jsonDocument);
+          } catch (Exception ex) {
+            log.warning ("Error inserting doc: " + ex);
+          }
+        });
+
+  }
 
   private static JsonDocument getItem(String id) {
     JsonDocument response = null;
@@ -147,8 +255,12 @@ public class DeleteOrphans {
 
   private static boolean removeHanger(String hangerId, JsonDocument hangerInfo, List<String> keys) {
 
-
     JsonDocument doc = getItem(hangerId);
+    if (doc == null && hangerInfo == null) {
+      log.info("getItem returns NULL for: " + hangerId);
+      return false;
+    }
+
     if (doc != null) {
       removeAspects(doc, keys);
       deleteItem(hangerId, keys);
@@ -169,8 +281,18 @@ public class DeleteOrphans {
             deleteItem(newhangerId, keys);
           }
         }
+        // remove aliases
+        if (hangerInfo.content().getObject("aliases") != null && hangerInfo.content().getObject("aliases").getArray("externalId") != null) {
+          JsonArray extIDs = hangerInfo.content().getObject("aliases").getArray("externalId");
+          for (int i = 0; i < extIDs.size(); i++) {
+            String extId = hangerInfo.content().getObject("aliases").getArray("externalId").getString(i);
+            if (extId != null && !extId.isEmpty()) {
+              String hangerAlias = "HangerAlias::externalId::" + extId;
+              deleteItem(hangerAlias, keys);
+            }
+          }
+        }
       }
-
     }
 
     return true;
@@ -194,7 +316,7 @@ public class DeleteOrphans {
     log.info ("Started @ " + new Date());
 
     CouchbaseEnvironment env = DefaultCouchbaseEnvironment.builder()
-            .connectTimeout(TimeUnit.SECONDS.toMillis(60L)) 
+            .connectTimeout(TimeUnit.SECONDS.toMillis(60L))
             .kvTimeout(TimeUnit.SECONDS.toMillis(60L))
             .viewTimeout(TimeUnit.SECONDS.toMillis(1200L))
             .maxRequestLifetime(TimeUnit.SECONDS.toMillis(1200L))
@@ -202,6 +324,7 @@ public class DeleteOrphans {
 
     Cluster cluster = CouchbaseCluster.create(env, cbAddress);
 
+    Cluster rescueCluster = null;
 
     try {
       bucket = cluster.openBucket(cbBucket, cbBucketPwd);
@@ -210,72 +333,58 @@ public class DeleteOrphans {
       bucket = cluster.openBucket(cbBucket);
     }
 
-
-
-    ViewQuery query = null;
-    if (devView) {
-      query = ViewQuery.from(design, view).development();
-    } else {
-      query = ViewQuery.from(design, view);
-    }
-    if (startKey != null) {
-      query = query.startKey(startKey);
-    }
-    if (limit > 0) {
-      query.limit(limit);
-    }
-
-    if (skip > 0) {
-      query.skip(skip);
-    }
-
-    ViewResult result = bucket.query(query);
-    total = result.totalRows();
-    if (limit > 0) {
-        total = limit;
-        if (skip > 0) total = total - skip;
-    }
-    log.info("Number of Hangers to process : " + total);
-    log.info("Number of Threads: " + numThreads);
-    timeStarted = System.currentTimeMillis();
-
-    ExecutorService executor = Executors.newFixedThreadPool(numThreads);
-    BoundedExecutor bex = new BoundedExecutor(executor, numThreads);
-
-    for (ViewRow row : result) {
-
-        bex.submitTask(() -> processRow(row.id()));
-
-      // Not ideal as we have multiple threads running, but it should help jump out early when done
-      if (batchSize > 0 && (removed + converted) >= batchSize) {
-        break;
+    if (rescueCbBucket != null && !rescueCbBucket.isEmpty()) {
+      rescueCluster = CouchbaseCluster.create(env, rescueCbAddress);
+      try {
+        log.info("rescueCbBucket: " + rescueCbBucket);
+        log.info("rescueCbBucketPwd: " + rescueCbBucketPwd);
+        rescueBucket = rescueCluster.openBucket(rescueCbBucket, rescueCbBucketPwd);
+      } catch (Exception e) {
+        log.info("Exception: " + e);
+        rescueCluster.authenticate("cmuser", rescueCbBucketPwd);
+        rescueBucket = rescueCluster.openBucket(rescueCbBucket);
       }
     }
-    executor.shutdown();
-    executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+
+    if (restore) {
+      restoreDeleted();
+    } else {
+      delete();
+    }
+
     bucket.close();
     cluster.disconnect();
+
+    if (rescueBucket != null) {
+      rescueBucket.close();
+      if (rescueCluster!=null) {
+        rescueCluster.disconnect();
+      }
+    }
 
     log.info ("Finished @ " + new Date());
 
     showStatistics();
 
-
-    cluster.disconnect();
   }
 
   private static void showStatistics() {
 
     StringBuffer buf = new StringBuffer();
-    buf.append("==============================================================\n");
-    buf.append("Number of Hangers processed       : " + processed + "\n");
-    buf.append("Number of Orphan Hangers removed  : " + removed   + "\n");
-    buf.append("Number of Legacy Hangers converted: " + converted + "\n");
+    if (!restore) {
+      buf.append("==============================================================\n");
+      buf.append("Number of Hangers processed       : " + processed + "\n");
+      buf.append("Number of Orphan Hangers removed  : " + removed + "\n");
+      buf.append("Number of Legacy Hangers converted: " + converted + "\n");
 
-    for (String key : totals.keySet()) {
-      buf.append(key).append(" : ").append(totals.get(key)).append("\n");
+      for (String key : totals.keySet()) {
+        buf.append(key).append(" : ").append(totals.get(key)).append("\n");
+      }
+    } else {
+      buf.append("==============================================================\n");
+      buf.append("Number of Docs restored       : " + restored + "\n");
     }
-    buf.append("==============================================================\n");
+    buf.append("==============================================================");
 
     log.info(buf.toString());
 
@@ -283,10 +392,6 @@ public class DeleteOrphans {
 
   private static boolean processRow(String hangerId) {
 
-    if (batchSize > 0 && (removed + converted) >= batchSize) {
-      
-    }
-    
     List<JsonDocument> updates = new ArrayList<>();
     List<String> deletes = new ArrayList<>();
     processed++;
@@ -301,38 +406,44 @@ public class DeleteOrphans {
     } else if (fixData || tidyUp){
       boolean needsIndexing = false;
       JsonDocument hanger = getItem(hangerId);
-      String type = hanger.content().getString("type");
-      accumlateTotals ("Doc. Type " + type);
-      if (fixData) {
-        if (type.equalsIgnoreCase(NOSQL_IMAGE_TYPE)) {
-          needsIndexing = convertAspect(hangerId, hanger, NOSQL_IMAGE_TYPE, ATEX_ONECMS_IMAGE, "com.atex.onecms.app.dam.standard.aspects.OneImageBean", false, updates, deletes);
-          converted++;
-        } else if (type.equalsIgnoreCase(NOSQL_ARTICLE_TYPE)) {
-          needsIndexing = convertAspect(hangerId, hanger, NOSQL_ARTICLE_TYPE, ATEX_ONECMS_ARTICLE, "com.atex.onecms.app.dam.standard.aspects.CustomArticleBean", true, updates, deletes);
-          converted++;
-          } else if (type.equalsIgnoreCase(ATEX_ONECMS_ARTICLE )) {
+      if (hanger != null) {
+        String type = hanger.content().getString("type");
+        accumlateTotals("Doc. Type " + type);
+        if (fixData) {
+          if (type.equalsIgnoreCase(NOSQL_IMAGE_TYPE)) {
+            needsIndexing = convertAspect(hangerId, hanger, NOSQL_IMAGE_TYPE, ATEX_ONECMS_IMAGE, "com.atex.onecms.app.dam.standard.aspects.OneImageBean", false, updates, deletes);
+            converted++;
+          } else if (type.equalsIgnoreCase(NOSQL_ARTICLE_TYPE)) {
+            needsIndexing = convertAspect(hangerId, hanger, NOSQL_ARTICLE_TYPE, ATEX_ONECMS_ARTICLE, "com.atex.onecms.app.dam.standard.aspects.CustomArticleBean", true, updates, deletes);
+            converted++;
+          } else if (type.equalsIgnoreCase(ATEX_ONECMS_ARTICLE)) {
             //needsIndexing = fixAspectTimeState(hanger, ATEX_ONECMS_ARTICLE, NOSQL_ARTICLE_TYPE, updates);
-          }  else if (type.equalsIgnoreCase(ATEX_ONECMS_IMAGE)) {
+          } else if (type.equalsIgnoreCase(ATEX_ONECMS_IMAGE)) {
             //needsIndexing = fixAspectTimeState(hanger, ATEX_ONECMS_IMAGE, NOSQL_IMAGE_TYPE, updates);
+          }
         }
-      }
-      if (tidyUp) {
-        if (type.equalsIgnoreCase(ATEX_REMOTE_TRACKER)
-                || type.equalsIgnoreCase("com.atex.onecms.content.WorkspaceBean")
-                || type.equalsIgnoreCase("com.atex.onecms.content.DraftContent")
-                || type.equalsIgnoreCase("atex.activity.Activities")
-        ) {
-          accumlateTotals("Content type " + type + " removed");
-          removeHanger(hangerId, hangerInfo, deletes);
+        if (tidyUp) {
+          // NOTE: removing "atex.activity.Activities" we need also to remove the
+          // 'HangerAlias::externalId::onecms:6c5ec61f-44a4-4c83-9794-a8c0731e230d where onecms:6c5ec61f-44a4-4c83-9794-a8c0731e230d
+          // is the id of the versioned content otherwise we leaves objects that cannot be locked anymore. Seen during SNA cleanup!
+          // The same seems to apply to "com.atex.onecms.content.WorkspaceBean". Not sure about "com.atex.onecms.content.DraftContent" [max]
+          if (type.equalsIgnoreCase(ATEX_REMOTE_TRACKER)
+              || type.equalsIgnoreCase("com.atex.onecms.content.WorkspaceBean")
+              || type.equalsIgnoreCase("com.atex.onecms.content.DraftContent")
+              || type.equalsIgnoreCase("atex.activity.Activities")
+              ) {
+            accumlateTotals("Content type " + type + " removed");
+            removeHanger(hangerId, hangerInfo, deletes);
+          }
         }
-      }
-      if (needsIndexing) {
-        sendKafkaMutation (hangerId, hangerInfo, updates);
+        if (needsIndexing) {
+          sendKafkaMutation(hangerId, hangerInfo, updates);
+        }
       }
     }
     if (!updates.isEmpty()) sendUpdates(updates);
+    if (!deletes.isEmpty() && rescueBucket != null) sendToRescue(deletes);
     if (!deletes.isEmpty()) sendDeletes(deletes);
-
 
     float percentage = (float) processed * 100 / total;
     if (percentage >= lastPercentage.getAndSet((int) percentage) + 1) {
@@ -428,6 +539,52 @@ public class DeleteOrphans {
             .toBlocking()
             .lastOrDefault(null);
 
+  }
+
+  private static void delete() throws InterruptedException {
+    ViewQuery query;
+    if (devView) {
+      query = ViewQuery.from(design, view).development();
+    } else {
+      query = ViewQuery.from(design, view);
+    }
+    if (startKey != null) {
+      query = query.startKey(startKey);
+    }
+    if (limit > 0) {
+      query.limit(limit);
+    }
+    if (skip > 0) {
+      query.skip(skip);
+    }
+    //query.stale(Stale.FALSE);
+
+    ViewResult result = bucket.query(query);
+    total = result.totalRows();
+    log.info("Number of Hangers in the view : " + total);
+    log.info("limit : " + limit);
+    log.info("skip : " + skip);
+    if (limit > 0 && total > limit) {
+      total = limit;
+    }
+    log.info("Number of Hangers to process : " + total);
+    log.info("Number of Threads: " + numThreads);
+    timeStarted = System.currentTimeMillis();
+
+    ExecutorService executor = Executors.newFixedThreadPool(numThreads);
+    BoundedExecutor bex = new BoundedExecutor(executor, numThreads);
+
+    for (ViewRow row : result) {
+
+      bex.submitTask(() -> processRow(row.id()));
+
+      // Not ideal as we have multiple threads running, but it should help jump out early when done
+      if (batchSize > 0 && (removed + converted) >= batchSize) {
+        break;
+      }
+    }
+    executor.shutdown();
+    executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
   }
 
   private static void sendKafkaMutation(String hangerId, JsonDocument hangerInfo, List<JsonDocument> updates) {
@@ -627,6 +784,10 @@ public class DeleteOrphans {
     options.addOption("startKey", true, "Starting ID if re-starting the process after failure");
     options.addOption("numThreads", true, "Number of threads to use, default 10");
 
+    options.addOption("rescueCbAddress", true, "One Rescue Couchbase node address");
+    options.addOption("rescueCbBucket", true, "The Rescue bucket name");
+    options.addOption("rescueCbBucketPwd", true, "The Rescue bucket password");
+    options.addOption("restore", false, "Restore content from Rescue Bucket");
 
     try {
       CommandLineParser parser = new DefaultParser();
@@ -662,11 +823,19 @@ public class DeleteOrphans {
       if (cmdLine.hasOption("dryRun")) {
         dryRun = true;
       }
+      if (cmdLine.hasOption("restore")) {
+        restore = true;
+      }
       if (cmdLine.hasOption("batchSize")) {
         batchSize = Integer.parseInt(cmdLine.getOptionValue("batchSize"));
       }
       if (cmdLine.hasOption("numThreads")) {
         numThreads = Integer.parseInt(cmdLine.getOptionValue("numThreads"));
+        if (numThreads > 20) {
+          numThreads = 20;
+        } else if (numThreads < 1) {
+          numThreads = 8;
+        }
       }
 
       if (cmdLine.hasOption("startKey")) {
@@ -686,6 +855,20 @@ public class DeleteOrphans {
       }
       if (cmdLine.hasOption("tidyUp")) {
         tidyUp = true;
+      }
+
+      if (cmdLine.hasOption("rescueCbAddress")) {
+        rescueCbAddress = cmdLine.getOptionValue("rescueCbAddress");
+        if (!rescueCbAddress.isEmpty() && cmdLine.hasOption("rescueCbBucket")) {
+          rescueCbBucket = cmdLine.getOptionValue("rescueCbBucket");
+          if (!rescueCbBucket.isEmpty() && cmdLine.hasOption("rescueCbBucketPwd")) {
+            rescueCbBucketPwd = cmdLine.getOptionValue("rescueCbBucketPwd");
+          } else {
+            throw new Exception();
+          }
+        } else {
+          throw new Exception();
+        }
       }
 
     } catch (Exception e) {
