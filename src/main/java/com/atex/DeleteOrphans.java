@@ -51,6 +51,8 @@ public class DeleteOrphans {
   public static final String NOSQL_IMAGE_TYPE = "com.atex.nosql.image.ImageContentDataBean";
   public static final String ATEX_ONECMS_IMAGE = "atex.onecms.image";
   public static final String ATEX_ONECMS_ARTICLE = "atex.onecms.article";
+  public static final String NOSQL_VIDEO_BEAN = "com.atex.nosql.video.VideoContentDataBean";
+  public static final String ATEX_DAM_VIDEO = "atex.dam.standard.Video";
   private static final String NOSQL_ARTICLE_TYPE = "com.atex.nosql.article.ArticleBean";
   private static final String ARTCLE_BEAN_EXTENDED = "com.atex.nosql.article.ArticleBeanExtended";
   private static final String ATEX_REMOTE_TRACKER = "com.atex.nosql.RemoteContentTrackerBean";
@@ -420,6 +422,9 @@ public class DeleteOrphans {
             //needsIndexing = fixAspectTimeState(hanger, ATEX_ONECMS_ARTICLE, NOSQL_ARTICLE_TYPE, updates);
           } else if (type.equalsIgnoreCase(ATEX_ONECMS_IMAGE)) {
             //needsIndexing = fixAspectTimeState(hanger, ATEX_ONECMS_IMAGE, NOSQL_IMAGE_TYPE, updates);
+          }  else if (type.equalsIgnoreCase(NOSQL_VIDEO_BEAN)) {
+            needsIndexing = convertAspect(hangerId, hanger, NOSQL_VIDEO_BEAN, ATEX_DAM_VIDEO, "com.atex.onecms.app.dam.standard.aspects.CustomVideoBean", false, updates, deletes);
+            converted++;
           }
         }
         if (tidyUp) {
@@ -704,6 +709,25 @@ public class DeleteOrphans {
           data.put ("inputTemplate", "p.DamWireArticle");
           accumlateTotals("Converted to Wire Article");
           needsIndexing = true;
+        }
+
+        if(sourceType.equalsIgnoreCase(NOSQL_VIDEO_BEAN)){
+          String engagementAspectContentId = aspects.getString("engagementAspect");
+          String publishingAspectContentId = aspects.getString("com.atex.gong.publish.PublishingBean");
+
+          /**
+           *  Set input template based on whether video was published / has engagementAspect
+           */
+          if (engagementAspectContentId != null || publishingAspectContentId != null) {
+            data.put ("inputTemplate", "p.StandardVideo");
+
+          }else{
+            data.put ("inputTemplate", "p.DamVideo");
+          }
+
+          accumlateTotals("Converted to Custom Video");
+          needsIndexing = true;
+
         }
 
         /* Article bean extended is not used anymore, so will migrate the data into the standard bean */
