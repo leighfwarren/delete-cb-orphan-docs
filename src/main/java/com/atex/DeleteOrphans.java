@@ -48,8 +48,8 @@ import java.util.logging.SimpleFormatter;
 
 public class DeleteOrphans {
 
-  public static final String NOSQL_IMAGE_TYPE = "com.atex.nosql.image.ImageContentDataBean";
-  public static final String ATEX_ONECMS_IMAGE = "atex.onecms.image";
+  public static final String NOSQL_IMAGE_TYPE = "atex.onecms.image";
+  public static final String ATEX_ONECMS_IMAGE = "com.atex.onecms.app.dam.standard.aspects.CustomImageBean";
   public static final String ATEX_ONECMS_ARTICLE = "atex.onecms.article";
   public static final String NOSQL_VIDEO_BEAN = "com.atex.nosql.video.VideoContentDataBean";
   public static final String ATEX_DAM_VIDEO = "atex.dam.standard.Video";
@@ -413,7 +413,7 @@ public class DeleteOrphans {
         accumlateTotals("Doc. Type " + type);
         if (fixData) {
           if (type.equalsIgnoreCase(NOSQL_IMAGE_TYPE)) {
-            needsIndexing = convertAspect(hangerId, hanger, NOSQL_IMAGE_TYPE, ATEX_ONECMS_IMAGE, "com.atex.onecms.app.dam.standard.aspects.OneImageBean", false, updates, deletes);
+            needsIndexing = convertAspect(hangerId, hanger, NOSQL_IMAGE_TYPE, ATEX_ONECMS_IMAGE, "com.atex.onecms.app.dam.standard.aspects.CustomImageBean", false, updates, deletes);
             converted++;
           } else if (type.equalsIgnoreCase(NOSQL_ARTICLE_TYPE)) {
             needsIndexing = convertAspect(hangerId, hanger, NOSQL_ARTICLE_TYPE, ATEX_ONECMS_ARTICLE, "com.atex.onecms.app.dam.standard.aspects.CustomArticleBean", true, updates, deletes);
@@ -678,87 +678,90 @@ public class DeleteOrphans {
 
       JsonDocument aspect = getItem(aspectId);
       if (aspect != null && aspect.content().getString("name").equalsIgnoreCase(sourceType)) {
-        accumlateTotals("Converted from " + sourceType + " to " + targetType);
         aspect.content().put("name", targetType);
         JsonObject data = aspect.content().getObject("data");
-        data.put("_type", targetBean);
+        if (!data.get("_type").equals(targetBean)) {
+          String contentId = hanger.content().getObject("systemData").getString("contentId");
+          log.info("Converting "+contentId+": "+data.getString("_type")+" to "+targetBean);
+          accumlateTotals("Converted from " + sourceType + " to " + targetType + " name was = "+data.getString("_type"));
+          data.put("_type", targetBean);
 
-        if (data.containsKey("creationDate")) {
-          long creationDate = data.getLong("creationDate");
-          data.removeKey("creationDate");
+          if (data.containsKey("creationDate")) {
+            long creationDate = data.getLong("creationDate");
+            data.removeKey("creationDate");
 
-          data.put("creationdate", getDateObject(creationDate));
-          accumlateTotals("Creation date converted");
-        }
-
-        if (data.containsKey("timeState")) {
-          JsonObject tso = data.getObject("timeState");
-
-          tso.put ("_type", "com.atex.onecms.app.dam.types.TimeState");
-          accumlateTotals("Creation date converted");
-        }
-
-        // This is no longer in OneArticleBean
-        data.removeKey("editorsPickHeadline");
-        data.removeKey("webImage");
-        data.removeKey("actDraft");
-        data.removeKey("remoteContentId");
-
-        String name = (String) data.get("name");
-        if (convertWireArticles && name != null && name.matches(".*PRESSUK_.*")) {
-          data.put ("inputTemplate", "p.DamWireArticle");
-          accumlateTotals("Converted to Wire Article");
-          needsIndexing = true;
-        }
-
-        if(sourceType.equalsIgnoreCase(NOSQL_VIDEO_BEAN)){
-          String engagementAspectContentId = aspects.getString("engagementAspect");
-          String publishingAspectContentId = aspects.getString("com.atex.gong.publish.PublishingBean");
-
-          /**
-           *  Set input template based on whether video was published / has engagementAspect
-           */
-          if (engagementAspectContentId != null || publishingAspectContentId != null) {
-            data.put ("inputTemplate", "p.StandardVideo");
-
-          }else{
-            data.put ("inputTemplate", "p.DamVideo");
+            data.put("creationdate", getDateObject(creationDate));
+            accumlateTotals("Creation date converted");
           }
 
-          accumlateTotals("Converted to Custom Video");
-          needsIndexing = true;
+          if (data.containsKey("timeState")) {
+            JsonObject tso = data.getObject("timeState");
 
-        }
+            tso.put ("_type", "com.atex.onecms.app.dam.types.TimeState");
+            accumlateTotals("Creation date converted");
+          }
 
-        /* Article bean extended is not used anymore, so will migrate the data into the standard bean */
-        String extendedContentId = aspects.getString(ARTCLE_BEAN_EXTENDED);
-        if (extendedContentId != null) {
-          String extendedAspectId = getAspectIdFromContentId(extendedContentId);
-          deletes.add(extendedAspectId);
-          JsonDocument extended = getItem(extendedAspectId);
-          if (extended != null) {
-            JsonObject extendedData = extended.content().getObject("data");
+          // This is no longer in OneArticleBean
+          data.removeKey("editorsPickHeadline");
+          data.removeKey("webImage");
+          data.removeKey("actDraft");
+          data.removeKey("remoteContentId");
 
-            for (String key : extendedData.getNames()) {
-              if (!key.equalsIgnoreCase(("_type"))) {
-                data.put(key, extendedData.get(key));
-              }
+          String name = (String) data.get("name");
+          if (convertWireArticles && name != null && name.matches(".*PRESSUK_.*")) {
+            data.put ("inputTemplate", "p.DamWireArticle");
+            accumlateTotals("Converted to Wire Article");
+            needsIndexing = true;
+          }
+
+          if(sourceType.equalsIgnoreCase(NOSQL_VIDEO_BEAN)){
+            String engagementAspectContentId = aspects.getString("engagementAspect");
+            String publishingAspectContentId = aspects.getString("com.atex.gong.publish.PublishingBean");
+
+            /**
+             *  Set input template based on whether video was published / has engagementAspect
+             */
+            if (engagementAspectContentId != null || publishingAspectContentId != null) {
+              data.put ("inputTemplate", "p.StandardVideo");
+
+            }else{
+              data.put ("inputTemplate", "p.DamVideo");
             }
-          } else {
-            log.warning("Missing aspect " + extendedAspectId);
+
+            accumlateTotals("Converted to Custom Video");
+            needsIndexing = true;
+
           }
 
-          aspects.removeKey(ARTCLE_BEAN_EXTENDED);
-          accumlateTotals("Extended article bean aspect converted and removed");
-        }
-        if (!dryRun) {
-          log.info ("Converting Aspect " + aspectContentId + " to " + targetType);
-          updates.add (aspect);
-        } else {
-          log.info ("TEST  "+ aspectContentId + " to " + targetType);
+          /* Article bean extended is not used anymore, so will migrate the data into the standard bean */
+          String extendedContentId = aspects.getString(ARTCLE_BEAN_EXTENDED);
+          if (extendedContentId != null) {
+            String extendedAspectId = getAspectIdFromContentId(extendedContentId);
+            deletes.add(extendedAspectId);
+            JsonDocument extended = getItem(extendedAspectId);
+            if (extended != null) {
+              JsonObject extendedData = extended.content().getObject("data");
+
+              for (String key : extendedData.getNames()) {
+                if (!key.equalsIgnoreCase(("_type"))) {
+                  data.put(key, extendedData.get(key));
+                }
+              }
+            } else {
+              log.warning("Missing aspect " + extendedAspectId);
+            }
+
+            aspects.removeKey(ARTCLE_BEAN_EXTENDED);
+            accumlateTotals("Extended article bean aspect converted and removed");
+          }
+          if (!dryRun) {
+            log.info ("Converting Aspect " + aspectContentId + " to " + targetType);
+            updates.add (aspect);
+          } else {
+            log.info ("TEST  "+ aspectContentId + " to " + targetType);
+          }
         }
       }
-
     }
     String oneCMSAspectId = aspects.getString(ATEX_ONECMS);
 
