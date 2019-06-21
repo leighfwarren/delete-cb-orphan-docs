@@ -105,19 +105,24 @@ public class ChangeAspectBeanType {
             .autoreleaseAfter(5000)
             .build();
 
-    Cluster cluster = CouchbaseCluster.create(env, cbAddress);
+    Cluster cluster = null;
 
     try {
-      bucket = cluster.openBucket(cbBucket, cbBucketPwd);
-    } catch (Exception e) {
-      cluster.authenticate("cmuser", cbBucketPwd);
-      bucket = cluster.openBucket(cbBucket);
+      cluster = CouchbaseCluster.create(env, cbAddress);
+      try {
+        bucket = cluster.openBucket(cbBucket, cbBucketPwd);
+      } catch (Exception e) {
+        cluster.authenticate("cmuser", cbBucketPwd);
+        bucket = cluster.openBucket(cbBucket);
+      }
+      process();
+
+    } catch (InterruptedException e) {
+      log.warning("Process Interrupted: "+e.getMessage());
+    } finally {
+      if (bucket != null) bucket.close();
+      if (cluster != null) cluster.disconnect();
     }
-
-    process();
-
-    bucket.close();
-    cluster.disconnect();
 
     log.info ("Finished @ " + new Date());
 
@@ -156,11 +161,10 @@ public class ChangeAspectBeanType {
     timeStarted = System.currentTimeMillis();
 
     ExecutorService executor = Executors.newFixedThreadPool(numThreads);
-    BoundedExecutor bex = new BoundedExecutor(executor, numThreads);
 
     for (ViewRow row : result) {
 
-      bex.submitTask(() -> processRow(row.id()));
+      executor.submit(() -> processRow(row.id()));
 
       // Not ideal as we have multiple threads running, but it should help jump out early when done
       if (batchSize > 0 && (removed + converted) >= batchSize) {
