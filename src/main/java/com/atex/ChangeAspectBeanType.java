@@ -42,7 +42,7 @@ public class ChangeAspectBeanType {
   private static boolean dryRun = false;
   private static int batchSize = -1;
 
-  private static int maxConverted = 5;
+  private static int maxConverted = 0;
 
   private static Logger log = Logger.getLogger("Cleanup");
 
@@ -424,6 +424,7 @@ public class ChangeAspectBeanType {
     options.addOption("rescueCbBucket", true, "The Rescue bucket name");
     options.addOption("rescueCbBucketPwd", true, "The Rescue bucket password");
     options.addOption("restore", false, "Restore content from Rescue Bucket");
+    options.addOption("maxConverted", true, "Max hangers to convert");
 
     try {
       CommandLineParser parser = new DefaultParser();
@@ -499,6 +500,12 @@ public class ChangeAspectBeanType {
         } else {
           throw new Exception();
         }
+      }
+
+      if (cmdLine.hasOption("maxConverted")) {
+        maxConverted = Integer.parseInt(cmdLine.getOptionValue("maxConverted"));
+      } else {
+        throw new Exception();
       }
 
 
