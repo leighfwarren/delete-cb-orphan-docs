@@ -6,6 +6,7 @@ import com.couchbase.client.java.Bucket;
 import com.couchbase.client.java.Cluster;
 import com.couchbase.client.java.CouchbaseCluster;
 import com.couchbase.client.java.document.JsonDocument;
+import com.couchbase.client.java.document.RawJsonDocument;
 import com.couchbase.client.java.document.json.JsonArray;
 import com.couchbase.client.java.document.json.JsonObject;
 import com.couchbase.client.java.env.CouchbaseEnvironment;
@@ -41,6 +42,8 @@ public class ChangeAspectBeanType {
   private static boolean dryRun = false;
   private static int batchSize = -1;
 
+  private static int maxConverted = 5;
+
   private static Logger log = Logger.getLogger("Cleanup");
 
   private static volatile Map<String, Long> totals = new TreeMap<>();
@@ -63,6 +66,12 @@ public class ChangeAspectBeanType {
   private static long timeStarted = 0;
 
   private static boolean restore = false;
+  private static String rescueCbAddress;
+  private static String rescueCbBucket;
+  private static String rescueCbBucketPwd;
+  private static Bucket rescueBucket;
+
+
   private static AtomicInteger restored = new AtomicInteger();
 
   private static JsonDocument getItem(String id) {
@@ -106,6 +115,7 @@ public class ChangeAspectBeanType {
             .build();
 
     Cluster cluster = null;
+    Cluster rescueCluster = null;
 
     try {
       cluster = CouchbaseCluster.create(env, cbAddress);
@@ -114,6 +124,19 @@ public class ChangeAspectBeanType {
       } catch (Exception e) {
         cluster.authenticate("cmuser", cbBucketPwd);
         bucket = cluster.openBucket(cbBucket);
+      }
+
+      if (rescueCbBucket != null && !rescueCbBucket.isEmpty()) {
+        rescueCluster = CouchbaseCluster.create(env, rescueCbAddress);
+        try {
+          log.info("rescueCbBucket: " + rescueCbBucket);
+          log.info("rescueCbBucketPwd: " + rescueCbBucketPwd);
+          rescueBucket = rescueCluster.openBucket(rescueCbBucket, rescueCbBucketPwd);
+        } catch (Exception e) {
+          log.info("Exception: " + e);
+          rescueCluster.authenticate("cmuser", rescueCbBucketPwd);
+          rescueBucket = rescueCluster.openBucket(rescueCbBucket);
+        }
       }
       process();
 
@@ -170,6 +193,9 @@ public class ChangeAspectBeanType {
       if (batchSize > 0 && (removed + converted) >= batchSize) {
         break;
       }
+      if (maxConverted > 0 && converted >= maxConverted) {
+        break;
+      }
     }
     executor.shutdown();
     executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
@@ -194,33 +220,40 @@ public class ChangeAspectBeanType {
   private static boolean processRow(String itemId) {
 
     List<JsonDocument> updates = new ArrayList<>();
+    List<String> keys = new ArrayList<>();
+
     processed++;
+
+    if (maxConverted > 0 && converted >= maxConverted) {
+      return false;
+    }
 
     if (itemId.startsWith("Aspect::")) {
       JsonDocument item = getItem(itemId);
-      if (item != null && item.content() != null && item.content().getString("name").equals(ATEX_ONECMS_IMAGE)) {
-        JsonObject data = item.content().getObject("data");
-        if (data.getString("_type").equals(BEAN_SOURCE_TYPE)) {
-          accumlateTotals("Doc. Type " + data.getString("_type"));
-          if (!dryRun) {
-            log.info ("Converting Hanger " + itemId + " to " + BEAN_DEST_TYPE);
-            data.put("_type", BEAN_DEST_TYPE);
-            updates.add(item);
-          } else {
-            log.info ("Test Aspect " + itemId + " to " + BEAN_DEST_TYPE);
-          }
-          try {
-
-          } catch (Exception e) {
-            e.printStackTrace();
-          }
+      if (item != null && item.content() != null && item.content().getObject("data") != null
+          && item.content().getObject("data").getString("_type").equals(BEAN_SOURCE_TYPE)) {
+        accumlateTotals("Doc. Type " + item.content().getObject("data").getString("_type"));
+        keys.add(itemId);
+        converted++;
+        if (!false) {
+          log.info ("Converting Hanger " + itemId + " to " + BEAN_DEST_TYPE);
+          item.content().getObject("data").put("_type", BEAN_DEST_TYPE);
+          updates.add(item);
+        } else {
+          log.info ("Test Aspect " + itemId + " to " + BEAN_DEST_TYPE);
+        }
+        try {
+          if (!keys.isEmpty() && rescueBucket != null) sendToRescue(keys);
+          if (!dryRun && !updates.isEmpty()) sendUpdates(updates);
+        } catch (Exception e) {
+          e.printStackTrace();
         }
       }
-      if (!dryRun && !updates.isEmpty()) sendUpdates(updates);
+
     }
 
     float percentage = (float) processed * 100 / total;
-    if (percentage >= lastPercentage.getAndSet((int) percentage) + 1) {
+    if (percentage >= lastPercentage.getAndSet((int) percentage) + .1) {
         String out = String.format("%f", percentage);
         long now = System.currentTimeMillis();
         float duration = now - timeStarted;
@@ -263,6 +296,50 @@ public class ChangeAspectBeanType {
                     .build())
             .toBlocking()
             .lastOrDefault(null);
+  }
+
+  private static void sendToRescue(List<String> keys) {
+    Observable
+        .from(keys)
+        .flatMap(new Func1<String, Observable<RawJsonDocument>>() {
+          @Override
+          public Observable<RawJsonDocument> call(String key) {
+            return bucket.async().get(key, RawJsonDocument.class);
+          }
+        })
+        .retryWhen(RetryBuilder
+            .anyOf(BackpressureException.class)
+            .delay(Delay.exponential(TimeUnit.MILLISECONDS, 100))
+            .max(10)
+            .build())
+        .toBlocking()
+        .subscribe(jsonDocument ->  {
+          try {
+            rescueBucket.insert(jsonDocument);
+          } catch (Exception ex) {
+            log.warning ("Error inserting doc: " + ex);
+          }
+        });
+
+  }
+
+  private static void sendUpdatedToRescue(List<JsonDocument> updates) {
+    Observable
+        .from(updates)
+        .retryWhen(RetryBuilder
+            .anyOf(BackpressureException.class)
+            .delay(Delay.exponential(TimeUnit.MILLISECONDS, 100))
+            .max(10)
+            .build())
+        .toBlocking()
+        .subscribe(jsonDocument ->  {
+          try {
+            rescueBucket.insert(jsonDocument);
+          } catch (Exception ex) {
+            log.warning ("Error inserting doc: " + ex);
+          }
+        });
+
   }
 
   private static String getAspectIdFromContentId(String aspectContentId) {
@@ -343,6 +420,11 @@ public class ChangeAspectBeanType {
     options.addOption("startKey", true, "Starting ID if re-starting the process after failure");
     options.addOption("numThreads", true, "Number of threads to use, default 10");
 
+    options.addOption("rescueCbAddress", true, "One Rescue Couchbase node address");
+    options.addOption("rescueCbBucket", true, "The Rescue bucket name");
+    options.addOption("rescueCbBucketPwd", true, "The Rescue bucket password");
+    options.addOption("restore", false, "Restore content from Rescue Bucket");
+
     try {
       CommandLineParser parser = new DefaultParser();
       CommandLine cmdLine = parser.parse(options, args);
@@ -400,6 +482,26 @@ public class ChangeAspectBeanType {
       if (cmdLine.hasOption("limit")) {
         limit = Integer.parseInt (cmdLine.getOptionValue("limit"));
       }
+
+      if (cmdLine.hasOption("restore")) {
+        restore = true;
+      }
+
+      if (cmdLine.hasOption("rescueCbAddress")) {
+        rescueCbAddress = cmdLine.getOptionValue("rescueCbAddress");
+        if (!rescueCbAddress.isEmpty() && cmdLine.hasOption("rescueCbBucket")) {
+          rescueCbBucket = cmdLine.getOptionValue("rescueCbBucket");
+          if (!rescueCbBucket.isEmpty() && cmdLine.hasOption("rescueCbBucketPwd")) {
+            rescueCbBucketPwd = cmdLine.getOptionValue("rescueCbBucketPwd");
+          } else {
+            throw new Exception();
+          }
+        } else {
+          throw new Exception();
+        }
+      }
+
+
     } catch (Exception e) {
       e.printStackTrace();
       formatter.printHelp("ChangeAspectType", options);
