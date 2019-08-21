@@ -71,6 +71,8 @@ public class ChangeAspectBeanType {
   private static String rescueCbBucketPwd;
   private static Bucket rescueBucket;
 
+  private static HashMap<String,String> onecmsAspects = new HashMap<>();
+
 
   private static AtomicInteger restored = new AtomicInteger();
 
@@ -199,6 +201,22 @@ public class ChangeAspectBeanType {
     }
     executor.shutdown();
     executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+
+    log.info("Found "+onecmsAspects.size()+" hangers");
+    for (String hangerId : onecmsAspects.keySet()) {
+      String aspectId = onecmsAspects.get(hangerId);
+      JsonDocument aspect = getItem(aspectId);
+      JsonObject data = aspect.content().getObject("data");
+      if (data != null) data.put("_type", BEAN_DEST_TYPE);
+      List<JsonDocument> updates = new ArrayList<>();
+      updates.add(aspect);
+      log.info("hangerId = "+hangerId);
+      log.info("aspectId = "+aspectId);
+      if (!dryRun) sendUpdates(updates);
+      if (rescueBucket != null) sendToRescue(new ArrayList<>(onecmsAspects.values()));
+    }
+
+    showStatistics();
   }
 
   private static void showStatistics() {
@@ -228,50 +246,34 @@ public class ChangeAspectBeanType {
       return false;
     }
 
-    if (itemId.startsWith("Aspect::")) {
-      JsonDocument item = getItem(itemId);
-      if (item != null && item.content() != null && item.content().getObject("data") != null
-          && item.content().getObject("data").getString("_type").equals(BEAN_SOURCE_TYPE)) {
-        accumlateTotals("Doc. Type " + item.content().getObject("data").getString("_type"));
-        keys.add(itemId);
-        converted++;
-        if (!false) {
-          log.info ("Converting Hanger " + itemId + " to " + BEAN_DEST_TYPE);
-          item.content().getObject("data").put("_type", BEAN_DEST_TYPE);
-          updates.add(item);
-        } else {
-          log.info ("Test Aspect " + itemId + " to " + BEAN_DEST_TYPE);
-        }
-        try {
-          if (!keys.isEmpty() && rescueBucket != null) sendToRescue(keys);
-          if (!dryRun && !updates.isEmpty()) sendUpdates(updates);
-        } catch (Exception e) {
-          e.printStackTrace();
+    if (itemId.startsWith("Hanger::")) {
+      JsonDocument hanger = getItem(itemId);
+      if (hanger != null && hanger.content() != null) {
+        JsonObject aspects = hanger.content().getObject("aspectLocations");
+        String aspectContentId = aspects.getString(ATEX_ONECMS_IMAGE);
+        if (aspectContentId!=null && !alreadyConverted(aspectContentId)) {
+          String aspectId = getAspectIdFromContentId(aspectContentId);
+
+          JsonDocument aspect = getItem(aspectId);
+          if (aspect != null && aspect.content().getString("name").equalsIgnoreCase(ATEX_ONECMS_IMAGE)) {
+            JsonObject data = aspect.content().getObject("data");
+            if (data != null && data.getString("_type").equals(BEAN_SOURCE_TYPE)) {
+
+              accumlateTotals("Doc. Type " + aspect.content().getObject("data").getString("_type"));
+              onecmsAspects.put(itemId, aspectId);
+              converted++;
+            }
+          }
         }
       }
-
     }
 
-    float percentage = (float) processed * 100 / total;
-    if (percentage >= lastPercentage.getAndSet((int) percentage) + .1) {
-        String out = String.format("%f", percentage);
-        long now = System.currentTimeMillis();
-        float duration = now - timeStarted;
-        long last = lastTime.getAndSet(now);
-        if (last != 0) {
-          duration = now - last;
-        }
-        // Duration of last 1%
-        float percentRemaining = 100 - percentage;
-        long timeRemaining = (long) (duration * percentRemaining);
-
-        long endTime = now + timeRemaining;
-        showStatistics();
-        log.info("=== HANGERS PROCESSED: " + processed + ", %age = " + out + ", ETA : " + new Date(endTime));
-    }
     return false;
   }
 
+  private static String getAspectIdFromContentId(String aspectContentId) {
+    return "Aspect::" + aspectContentId.replace("onecms:", "").replace(":", "::");
+  }
 
   private static void sendUpdates(List<JsonDocument> items) {
     //items.forEach(doc -> System.out.println(doc.id()));
@@ -340,10 +342,6 @@ public class ChangeAspectBeanType {
           }
         });
 
-  }
-
-  private static String getAspectIdFromContentId(String aspectContentId) {
-    return "Aspect::" + aspectContentId.replace("onecms:", "").replace(":", "::");
   }
 
   private static String getHangerIdFromContentId(String hangerContentId) {
