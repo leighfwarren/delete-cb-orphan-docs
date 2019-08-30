@@ -137,7 +137,9 @@ public class FixImageNameAndAspectBean {
       log.warning("Process Interrupted: "+e.getMessage());
     } finally {
       if (bucket != null) bucket.close();
+      if (rescueBucket != null) rescueBucket.close();
       if (cluster != null) cluster.disconnect();
+      if (rescueCluster != null) rescueCluster.disconnect();
     }
 
     log.info ("Finished @ " + new Date());
