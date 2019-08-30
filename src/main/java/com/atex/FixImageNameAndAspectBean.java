@@ -27,7 +27,7 @@ import java.util.logging.FileHandler;
 import java.util.logging.Logger;
 import java.util.logging.SimpleFormatter;
 
-public class FiixImageNameAndAspectBean {
+public class FixImageNameAndAspectBean {
 
   public static final String ATEX_ONECMS_IMAGE = "atex.onecms.image";
   public static final String BEAN_SOURCE_TYPE = "com.atex.onecms.app.dam.standard.aspects.OneImageBean";
@@ -45,7 +45,7 @@ public class FiixImageNameAndAspectBean {
 
   private static int maxConverted = 0;
 
-  private static Logger log = Logger.getLogger("PopulateImageName");
+  private static Logger log = Logger.getLogger("FixImageNameAndAspectBean");
 
   private static volatile Map<String, Long> totals = new TreeMap<>();
 
@@ -89,7 +89,7 @@ public class FiixImageNameAndAspectBean {
 
   private static void execute() throws Exception {
 
-    String filename = "populate-image-bean-" + new Date().getTime() + ".log";
+    String filename = "fix-image-name-and-aspect-bean-" + new Date().getTime() + ".log";
     FileHandler fileHandler = new FileHandler(filename);
     SimpleFormatter simple = new SimpleFormatter();
     fileHandler.setFormatter(simple);
@@ -580,7 +580,7 @@ public class FiixImageNameAndAspectBean {
 
     } catch (Exception e) {
       e.printStackTrace();
-      formatter.printHelp("PopulateImageName", options);
+      formatter.printHelp("FixImageNameAndAspectBean", options);
       System.exit(-99);
     }
 
